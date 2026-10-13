@@ -28,11 +28,11 @@ def myAI(state: GameState) -> Action:
     #print(state.chips_in_pot)
     #Call_Odds = MonteCarlo(sx,Action.call(), 0)
     #print(state.chips_in_pot)
-    
+
     if len(state.community_cards) == 0:
         return Action.call()
     else:
-        return Action.raise_by(state.my_player.chips_in_stack-state.my_player.chips_bet)
+        return Action.raise_by(max(state.my_player.chips_in_stack-state.my_player.chips_bet,0))
     return defaultAI(state)
 
 
