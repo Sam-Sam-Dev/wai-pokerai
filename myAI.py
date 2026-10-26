@@ -5,7 +5,7 @@ from poker.card import Rank
 from poker.card import Card
 from poker.card import Suit
 import random
-import treys
+#import treys
 import csv
 
 def generate_deck(cards):
@@ -67,6 +67,7 @@ def myAI(state: GameState) -> Action:
         return Action.raise_by(state.my_player.chips_in_stack-state.my_player.chips_bet)
     else:
         return Action.fold()
+    """
     allin = 0
     stacks = [p.chips_in_stack for p in state.players]
     if state.my_player.chips_in_stack == max(stacks):
@@ -138,7 +139,7 @@ def myAI(state: GameState) -> Action:
     else:
         to_call = max([p.chips_bet for p in state.players])-state.my_player.chips_bet
         return Action.call() if to_call != 0 else Action.check()
-            
+           """ 
     """ # call then all in
     if len(state.community_cards) == 0:
         return Action.call()
