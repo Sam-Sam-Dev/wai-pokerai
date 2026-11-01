@@ -1,10 +1,12 @@
 from poker.action import Action
 from poker.game_state import GameState
 from poker.card import Rank
+from poker.player import Blind
 #from poker.hand import evaluate
 from poker.card import Card
 from poker.card import Suit
 import random
+import torch
 #import treys
 import csv
 
@@ -61,10 +63,13 @@ def myAI(state: GameState) -> Action:
     #print(state.chips_in_pot)
     #Call_Odds = MonteCarlo(sx,Action.call(), 0)
     #print(state.chips_in_pot)
-    if len(state.community_cards) == 0:
-        return Action.call()
-    elif max(state.my_player.chips_in_stack-state.my_player.chips_bet,0) != 0:
-        return Action.raise_by(state.my_player.chips_in_stack-state.my_player.chips_bet)
+    if state.my_player.blind is Blind.BIG:
+        if len(state.community_cards) == 0:
+            return Action.call()
+        elif max(state.my_player.chips_in_stack-state.my_player.chips_bet,0) != 0:
+            return Action.raise_by(min(state.my_player.chips_in_stack-state.my_player.chips_bet,state.min_raise))
+        else:  
+            return Action.fold()
     else:
         return Action.fold()
     """
