@@ -7,7 +7,7 @@ from poker.card import Card
 from poker.card import Suit
 import random
 #import torch
-import treys
+#import treys
 import csv
 
 def generate_deck(cards):
