@@ -64,7 +64,7 @@ def myAI(state: GameState) -> Action:
             return Action.call()
         elif max(state.my_player.chips_in_stack-state.my_player.chips_bet,0) != 0:
             #return Action.raise_by(min(state.my_player.chips_in_stack-state.my_player.chips_bet,state.min_raise))
-            return Action.raise_by(state.my_player.chips_in_stack-state.my_player.chips_bet,0)
+            return Action.raise_by(max(state.my_player.chips_in_stack-state.my_player.chips_bet,0))
         else:  
             return Action.fold()
     else:
