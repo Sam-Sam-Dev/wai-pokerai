@@ -6,8 +6,8 @@ from poker.player import Blind
 from poker.card import Card
 from poker.card import Suit
 import random
-import torch
-#import treys
+#import torch
+import treys
 import csv
 
 def generate_deck(cards):
@@ -59,18 +59,56 @@ all_in = 0
 def myAI(state: GameState) -> Action:
     global comsize
     global all_in
-    #sx = state
-    #print(state.chips_in_pot)
-    #Call_Odds = MonteCarlo(sx,Action.call(), 0)
-    #print(state.chips_in_pot)
     if state.my_player.blind is Blind.BIG:
         if len(state.community_cards) == 0:
             return Action.call()
         elif max(state.my_player.chips_in_stack-state.my_player.chips_bet,0) != 0:
-            return Action.raise_by(min(state.my_player.chips_in_stack-state.my_player.chips_bet,state.min_raise))
+            #return Action.raise_by(min(state.my_player.chips_in_stack-state.my_player.chips_bet,state.min_raise))
+            return Action.raise_by(state.my_player.chips_in_stack-state.my_player.chips_bet,0)
         else:  
             return Action.fold()
     else:
+        return Action.fold()
+    #sx = state
+    #print(state.chips_in_pot)
+    #Call_Odds = MonteCarlo(sx,Action.call(), 0)
+    #print(state.chips_in_pot)
+    #if state.my_player.blind is Blind.BIG:
+    to_call = max([p.chips_bet for p in state.players])-state.my_player.chips_bet
+    mh = list(state.my_player.hole_cards)
+    comc = list(state.community_cards)
+    hand = [treys.Card.new(card_to_string(mh[0])),treys.Card.new(card_to_string(mh[1]))]
+    board = []
+    for c in comc:
+        board.append(treys.Card.new(card_to_string(c)))
+    #print("67")
+    heval = treys.Evaluator()
+    
+    #print("hehe")
+    if len(state.community_cards) != 0:
+        hscore = heval.evaluate(hand=hand,board=board)
+        #print("hehe2")
+        p_rank = heval.get_five_card_rank_percentage(hscore)
+        
+        #print("hehe3")
+        #print(p_rank)
+        #print("hehe end")
+        passed = True
+        for pl in state.players:
+            if pl.chips_in_stack != 0:
+                if random.random() < p_rank * max(to_call/state.my_player.chips_in_stack,1.0):
+                    passed = False
+    if len(state.community_cards) == 0:
+        if to_call < 10:
+            return Action.call()
+        else:
+            return Action.fold()
+    elif max(state.my_player.chips_in_stack-state.my_player.chips_bet,0) != 0:
+        if p_rank < 0.1:
+            return Action.raise_by(min(state.my_player.chips_in_stack-state.my_player.chips_bet,state.min_raise))
+        else:
+            return Action.fold()
+    else:  
         return Action.fold()
     """
     allin = 0
@@ -164,7 +202,7 @@ if comsize == len(state.community_cards):
         return Action.call()
     comsize = len(state.community_cards)
     mh = list(state.my_player.hole_cards)
-comc = list(state.community_cards)
+    comc = list(state.community_cards)
     hand = [treys.Card.new(card_to_string(mh[0])),treys.Card.new(card_to_string(mh[1]))]
     board = []
     for c in comc:
