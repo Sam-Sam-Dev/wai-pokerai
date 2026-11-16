@@ -1,0 +1,12 @@
+poker test 100 examples/call_when_blind.py examples/go_all_in_on_pair.py examples/exploiter.py examples/raise_by_big_blind_unless_raised.py examples/go_all_in_on_ace.py myAI.py examples/raise_by_pot_when_biggest_stack.py examples/player_notes.py examples/bill_chen.py
+100 matches played until one AI has every chip, starting on 2 tables
+AI                                   Won  Avg chips  Avg place  Bad actions
+exploiter                          56.0%     1008.0       2.88            0
+bill_chen                          18.0%      324.0       4.29            0
+raise_by_big_blind_unless_raised   12.0%      216.0       4.45            0
+player_notes                       10.0%      180.0       5.30            0
+myAI                                3.0%       54.0       5.18            0
+call_when_blind                     1.0%       18.0       7.00            0
+go_all_in_on_pair                   0.0%        0.0       4.70            0
+go_all_in_on_ace                    0.0%        0.0       5.55            0
+raise_by_pot_when_biggest_stack     0.0%        0.0       5.65            0

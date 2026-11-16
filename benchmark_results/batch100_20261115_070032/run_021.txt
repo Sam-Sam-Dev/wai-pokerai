@@ -1,0 +1,12 @@
+poker test 100 examples/go_all_in_on_pair.py examples/go_all_in_on_ace.py examples/call_when_big_blind.py examples/sklansky_and_malmuth.py examples/bill_chen.py myAI.py examples/default.py examples/player_notes.py examples/raise_by_big_blind_unless_raised.py
+100 matches played until one AI has every chip, starting on 2 tables
+AI                                   Won  Avg chips  Avg place  Bad actions
+sklansky_and_malmuth               30.0%      540.0       4.89            0
+bill_chen                          25.0%      450.0       4.67            0
+raise_by_big_blind_unless_raised   20.0%      360.0       2.68            0
+myAI                               12.0%      216.0       4.82            0
+player_notes                        9.0%      162.0       5.39            0
+call_when_big_blind                 3.0%       54.0       6.46            0
+go_all_in_on_ace                    1.0%       18.0       5.93            0
+go_all_in_on_pair                   0.0%        0.0       4.81            0
+default                             0.0%        0.0       5.35            0

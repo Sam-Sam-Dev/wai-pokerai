@@ -1,0 +1,12 @@
+poker test 100 examples/player_notes.py examples/bill_chen.py examples/exploiter.py examples/sklansky_and_malmuth.py myAI.py examples/real_play_statistics.py examples/raise_by_pot.py examples/phil_hellmuth.py examples/raise_by_half_of_stack.py
+100 matches played until one AI has every chip, starting on 2 tables
+AI                         Won  Avg chips  Avg place  Bad actions
+exploiter                29.0%      522.0       4.14            0
+sklansky_and_malmuth     17.0%      306.0       3.81            0
+player_notes             13.0%      234.0       5.22            0
+real_play_statistics     11.0%      198.0       4.12            0
+bill_chen                10.0%      180.0       4.49            0
+phil_hellmuth             9.0%      162.0       4.38            0
+raise_by_pot              5.0%       90.0       7.51            0
+raise_by_half_of_stack    5.0%       90.0       7.29            0
+myAI                      1.0%       18.0       4.04            0

@@ -1,0 +1,19 @@
+{
+  "batches": 100,
+  "matches": 10000,
+  "mean_win_percent": 12.74,
+  "win_percent_ci95": [
+    10.48,
+    15.25
+  ],
+  "mean_place": 3.5413,
+  "mean_final_chips": 229.32,
+  "bad_actions": 0,
+  "median_batch_win_percent": 9.5,
+  "min_batch_win_percent": 0.0,
+  "max_batch_win_percent": 55.0,
+  "batch_win_std": 12.168500318445162,
+  "zero_win_batches": 5,
+  "leading_batches": 16,
+  "seconds": 3363.9400000000005
+}

@@ -1,0 +1,12 @@
+poker test 100 examples/raise_by_half_of_stack.py examples/real_play_statistics.py myAI.py examples/phil_hellmuth.py examples/bill_chen.py examples/go_all_in.py examples/raise_by_pot.py examples/call_preflop.py examples/call.py
+100 matches played until one AI has every chip, starting on 2 tables
+AI                         Won  Avg chips  Avg place  Bad actions
+real_play_statistics     22.0%      396.0       3.51            0
+bill_chen                18.0%      324.0       3.35            0
+phil_hellmuth            17.0%      306.0       3.20            0
+raise_by_half_of_stack   12.0%      216.0       6.29            0
+myAI                     12.0%      216.0       2.31            0
+raise_by_pot              8.0%      144.0       6.28            0
+go_all_in                 7.0%      126.0       6.69            0
+call                      4.0%       72.0       6.56            0
+call_preflop              0.0%        0.0       6.81            0

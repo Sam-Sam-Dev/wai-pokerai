@@ -1,0 +1,1 @@
+poker test 100 examples/raise_by_pot.py myAI.py examples/default.py examples/call.py examples/raise_by_big_blind_unless_raised.py examples/phil_hellmuth.py examples/sklansky_and_malmuth.py examples/exploiter.py examples/go_all_in_on_ace.py

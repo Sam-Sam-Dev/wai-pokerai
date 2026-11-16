@@ -1,0 +1,12 @@
+poker test 100 examples/exploiter.py examples/default.py myAI.py examples/go_all_in_on_ace.py examples/call_preflop.py examples/go_all_in.py examples/call_when_big_blind.py examples/raise_by_pot_when_biggest_stack.py examples/sklansky_and_malmuth.py
+100 matches played until one AI has every chip, starting on 2 tables
+AI                                  Won  Avg chips  Avg place  Bad actions
+exploiter                         43.0%      774.0       3.28            0
+myAI                              22.0%      396.0       3.39            0
+sklansky_and_malmuth              17.0%      306.0       4.13            0
+go_all_in                          9.0%      162.0       7.16            0
+go_all_in_on_ace                   4.0%       72.0       5.43            0
+raise_by_pot_when_biggest_stack    3.0%       54.0       4.73            0
+call_when_big_blind                2.0%       36.0       6.04            0
+default                            0.0%        0.0       3.79            0
+call_preflop                       0.0%        0.0       7.05            0
