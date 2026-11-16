@@ -30,7 +30,7 @@ for path in Path('examples').glob('*.py'):
 if len(examples) < 8:
     sys.exit('At least 8 example bots are required.')
 
-bots = ['myAI.py'] + random.sample(examples, 8)
+bots = ['myAI2.py'] + random.sample(examples, 8)
 random.shuffle(bots)
 command = ['poker', 'test', str(matches), *bots]
 print(shlex.join(command), flush=True)

@@ -1,431 +1,490 @@
-from poker.action import Action
-from poker.game_state import GameState
-from poker.card import Rank
-from poker.player import Blind
-#from poker.hand import evaluate
-from poker.card import Card
-from poker.card import Suit
+"""Equity/pot-odds bot for the WAI engine. Entry points: myAI and defaultAI.
+
+Optional classifier: put opponent_best.pth beside this file, or set
+POKER_OPPONENT_MODEL to an opponent-v1 checkpoint. Without one, legal ranges
+use a soft Chen preflop prior. No SR4/SR5 binary checkpoint is compatible.
+The classifier architecture and 1,369 features match the opponent collector.
+Raises assume all live opponents call what they can: no invented fold equity.
+No files are written, and the existing myAI bot and engine are not imported.
+"""
+from collections import Counter, OrderedDict
+from functools import lru_cache
+from itertools import combinations
+from pathlib import Path
+import hashlib
+import math
+import os
 import random
-#import torch
-#import treys
-import csv
+import time
 
-def generate_deck(cards):
-    deck = set()
-    for rank in Rank:
-        for suit in Suit:
-            if Card(rank, suit) not in cards:
-                deck.add(Card(rank, suit))
-    return deck
+import numpy as np
+import treys
+from poker.action import Action
+from poker.card import Rank, Suit
+from poker.game_state import GameState
+from poker.player import Blind
 
-def MonteCarlo(s: GameState, a: Action, depth):
-    # check if the game has ended
-    #if len(s.community_cards) == 5 and s.players[0].
-    #s.my_player.hole_cards
-    s.chips_in_pot += 500
-    if depth > 15:
-        return 0
+CLASSES = ('high_card', 'pair', 'two_pair', 'three_of_a_kind', 'straight',
+           'flush', 'full_house', 'four_of_a_kind', 'straight_flush', 'royal_flush')
+DECK = tuple(r+s for r in '23456789TJQKA' for s in 'shdc')
+CARD_INDEX = {card: i for i, card in enumerate(DECK)}
+TREYS = tuple(treys.Card.new(card) for card in DECK)
+RANK_TEXT = dict(zip(Rank, '23456789TJQKA'))
+SUIT_TEXT = dict(zip(Suit, 'shdc'))
+BASE_SIZE, SLOT_SIZE, INPUT_SIZE = 295, 358, 1369
+SIMULATIONS = 320
+DECISION_SECONDS = 0.65  # Leave room inside the engine's one-second alarm.
+EVALUATOR = treys.Evaluator()
+
+
+def card_text(card):
+    return RANK_TEXT[card.rank] + SUIT_TEXT[card.suit]
+
+
+def _straight(mask):
+    return bool(mask & (mask >> 1) & (mask >> 2) & (mask >> 3) & (mask >> 4)
+                or mask & 0x100F == 0x100F)
+
+
+def _category(indices):
+    counts, suits, mask = [0]*13, [0]*4, 0
+    for index in indices:
+        rank, suit = divmod(index, 4)
+        counts[rank] += 1
+        suits[suit] |= 1 << rank
+        mask |= 1 << rank
+    for suited in suits:
+        if suited.bit_count() >= 5:
+            if _straight(suited):
+                return 9 if suited & 0x1F00 == 0x1F00 else 8
+            return 5
+    groups = sorted(counts, reverse=True)
+    if groups[0] == 4:
+        return 7
+    if groups[0] == 3 and groups[1] >= 2:
+        return 6
+    if _straight(mask):
+        return 4
+    if groups[0] == 3:
+        return 3
+    if groups[0] == 2:
+        return 2 if groups[1] == 2 else 1
     return 0
 
-def card_to_string(card: Card) -> str:
-    rank_map = {
-        Rank.TWO: "2",
-        Rank.THREE: "3",
-        Rank.FOUR: "4",
-        Rank.FIVE: "5",
-        Rank.SIX: "6",
-        Rank.SEVEN: "7",
-        Rank.EIGHT: "8",
-        Rank.NINE: "9",
-        Rank.TEN: "T",
-        Rank.JACK: "J",
-        Rank.QUEEN: "Q",
-        Rank.KING: "K",
-        Rank.ACE: "A",
-    }
 
-    suit_map = {
-        Suit.SPADE: "s",
-        Suit.HEART: "h",
-        Suit.DIAMOND: "d",
-        Suit.CLUB: "c",
-    }
-
-    return rank_map[card.rank] + suit_map[card.suit]
-
-comsize = -1
-all_in = 0
-
-# Loaded once when the competition program imports this bot.
-from pathlib import Path
-import math
-import torch
-from torch import nn
-import treys
-from hand_categories import possible_hands
-from hand_categories import hand_category_probabilities
-
-# SR4 (active). To use SR5, comment out this checkpoint and architecture,
-# then uncomment both SR5 alternatives below and the feature call in myAI.
-_checkpoint = torch.load(Path(__file__).with_name('model_best_combined22.pth'),
-                         map_location='cpu', weights_only=True)
-_model = nn.Sequential(nn.Linear(155, 64), nn.ReLU(), nn.Linear(64, 32),
-                       nn.ReLU(), nn.Linear(32, 1))
-# SR5: replace this filename with your checkpoint trained on 164 inputs.
-# _checkpoint = torch.load(Path(__file__).with_name('model_best_sr5.pth'),
-#                          map_location='cpu', weights_only=True)
-# _model = nn.Sequential(nn.Linear(164, 64), nn.ReLU(), nn.Linear(64, 32),
-#                        nn.ReLU(), nn.Linear(32, 1))
-_model.load_state_dict(_checkpoint['model_state_dict'])
-_model.eval()
-_mean, _std = _checkpoint['mean'], _checkpoint['std']
-_evaluator = treys.Evaluator()
+@lru_cache(maxsize=128)
+def board_holdings(board):
+    """All board-legal pairs, category counts, and board-only priors."""
+    remaining = [i for i in range(52) if i not in board]
+    pairs, labels, counts = [], [], [0]*10
+    for a, b in combinations(remaining, 2):
+        label = _category((*board, a, b)) if board else 0
+        pairs.append((a, b))
+        labels.append(label)
+        counts[label] += 1
+    odds = tuple(n/len(pairs) for n in counts)
+    return tuple(pairs), tuple(labels), tuple(counts), odds
 
 
-def generate_features(state: GameState) -> list[float]:
-    """155 SR4 inputs at the latest completed-street/current-board boundary.
-
-    Deliberately reproduces the training serializer's cumulative bets, pot,
-    starting-stack minimum and zero call amount. Current-street actions are
-    used only to reconstruct starting stacks, not as trained boundary inputs.
-    """
-    count = len(state.players)
-    if not 2 <= count <= 8 or len(state.community_cards) not in (3, 4, 5):
-        raise ValueError('Model requires 2..8 players and a flop, turn or river')
-    # PHH indices begin at the small blind, or the big blind heads-up.
-    first_blind = Blind.BIG if count == 2 else Blind.SMALL
-    first = next(i for i, player in enumerate(state.players) if player.blind is first_blind)
-    players = state.players[first:] + state.players[:first]
-    seats = {player.id: i for i, player in enumerate(players)}
-    hero = seats[state.my_player.id]
-    current_street = len(state.community_cards)-2
-    actual_bets = [0.0]*count
-    contributions = [0.0]*count
-    for i, player in enumerate(players):
-        blind = state.small_blind if player.blind is Blind.SMALL else state.big_blind if player.blind is Blind.BIG else 0
-        actual_bets[i] = blind
-        contributions[i] = state.ante + blind
-    # Replay real contributions to recover stacks at the start of the hand.
-    # return_uncalled refunds unmatched contributions at each street end.
-    for street in range(current_street+1):
-        if street:
-            actual_bets = [0.0]*count
-        for action in state.history:
-            if action.street == street:
-                seat = seats[action.id]
-                contributions[seat] += action.chips_bet-actual_bets[seat]
-                actual_bets[seat] = action.chips_bet
-        if street < current_street:
-            top = max(range(count), key=contributions.__getitem__)
-            second = max(contributions[i] for i in range(count) if i != top)
-            contributions[top] -= max(0.0, contributions[top]-second)
-    stacks = [player.chips_in_stack+contributions[i] for i, player in enumerate(players)]
-    total = sum(stacks)
-    if total <= 0:
-        raise ValueError('Invalid starting chip total')
-    bets, folded = [0.0]*count, [False]*count
-    summaries = [0.0]*100
-    pot, to_call = 0.0, 0.0
-    for street in range(current_street):
-        raises = [0]*count
-        for action in state.history:
-            if action.street != street:
-                continue
-            seat = seats[action.id]
-            if action.kind is Action.Kind.FOLD:
-                folded[seat] = True
-            elif action.kind in (Action.Kind.CHECK, Action.Kind.CALL):
-                bets[seat] += min(to_call, stacks[seat]-bets[seat])
-                pot += to_call
-            elif action.kind is Action.Kind.RAISE:
-                bets[seat] += action.chips_bet
-                pot += action.chips_bet
-                to_call = action.chips_bet
-                raises[seat] += 1
-        for seat in range(count):
-            offset = 25*street+3*seat
-            summaries[offset] = bets[seat]/total if seat != hero else 0.0
-            summaries[offset+1] = raises[seat]
-            summaries[offset+2] = int(folded[seat]) if seat != hero else 0
-    hole = [treys.Card.new(card_to_string(card)) for card in state.my_player.hole_cards]
-    board_text = ''.join(sorted(card_to_string(card) for card in state.community_cards))
-    board = [treys.Card.new(board_text[i:i+2]) for i in range(0, len(board_text), 2)]
-    score = _evaluator.evaluate(board, hole)
-    best = [0]*9
-    best[min(9-_evaluator.get_rank_class(score), 8)] = 1
-    position = [int(i == hero) for i in range(8)]
-    general = [bets[hero]/total, 0.0, min(stacks)/total, pot/total,
-               _evaluator.get_five_card_rank_percentage(score)] + best
-    occupied = [int(i < count) for i in range(8)]
-    starting = [stack/total for stack in stacks]+[0.0]*(8-count)
-    blinds = ([1.0, state.small_blind/state.big_blind] if count == 2
-              else [0.5, 1.0]) + [0.0]*6
-    features = position+general+occupied+starting+blinds+summaries+list(possible_hands(board_text))
-    if len(features) != 155 or not all(math.isfinite(value) for value in features):
-        raise ValueError('Invalid model features')
-    return features
+def _ordered(players):
+    blind = Blind.BIG if len(players) == 2 else Blind.SMALL
+    first = next((i for i, p in enumerate(players) if p.blind is blind), 0)
+    return players[first:] + players[:first]
 
 
-def generate_features_sr5(state: GameState) -> list[float]:
-    """164 SR5 inputs: SR4 features followed by nine category probabilities.
-
-    Category order is high card through straight flush. Probabilities count
-    uniform legal hole-card pairs on the current board, excluding board cards
-    only (including holdings overlapping hero's cards, as in training SR5).
-    """
-    features = generate_features(state)
-    board_text = ''.join(sorted(card_to_string(card) for card in state.community_cards))
-    features += list(hand_category_probabilities(board_text))
-    if len(features) != 164 or not all(math.isfinite(value) for value in features):
-        raise ValueError('Invalid SR5 model features')
-    return features
+def _blinds(players, small, big):
+    return [float(small if p.blind is Blind.SMALL else big if p.blind is Blind.BIG else 0)
+            for p in players]
 
 
-# Completed hands are delivered on our next turn through previous_hands.
-import fcntl
-import hashlib
-import json
-import os
-import uuid
+def _replay(players, stacks, blinds, ante, actions, street, bb, finish=False):
+    """Match the collector's incremental contributions and boundary refunds."""
+    n = len(players)
+    seats = {p.id: i for i, p in enumerate(players)}
+    bets = [min(b, max(0., s-ante)) for s, b in zip(stacks, blinds)]
+    remaining = [s-min(s, ante)-b for s, b in zip(stacks, bets)]
+    paid = [s-r for s, r in zip(stacks, remaining)]
+    folded = [False]*n
+    summaries = np.zeros((4, 8, 5), dtype=np.float32)
+    current = 0
 
-_HAND_LOG = Path(os.environ.get('POKER_HAND_LOG',
-                 str(Path(__file__).with_name('hand_logs') / 'myAI.phhs')))
-_log_session = uuid.uuid4().hex
-_logged_hands = set()
-_observed_hands = {}
+    def refund():
+        top = max(range(n), key=bets.__getitem__)
+        excess = max(0., bets[top]-max(b for i, b in enumerate(bets) if i != top))
+        bets[top] -= excess
+        remaining[top] += excess
+        paid[top] -= excess
 
-VALUE = {
-    Rank.TWO: 2, Rank.THREE: 3, Rank.FOUR: 4, Rank.FIVE: 5,
-    Rank.SIX: 6, Rank.SEVEN: 7, Rank.EIGHT: 8, Rank.NINE: 9,
-    Rank.TEN: 10, Rank.JACK: 11, Rank.QUEEN: 12, Rank.KING: 13,
-    Rank.ACE: 14,
-}
-
-
-def chen(a: Card, b: Card) -> float:
-    # Bill Chen's score for two cards, only used to put the 1326 starting hands in order
-    high, low = sorted((VALUE[a.rank], VALUE[b.rank]), reverse=True)
-    score, gap = {14: 10, 13: 8, 12: 7, 11: 6}.get(high, high / 2), high - low - 1
-    return max(score * 2, 5) + (high == 5) if gap < 0 else score - min(gap, 4) - (gap >= 3) + 2 * (a.suit is b.suit) + (gap <= 1 and high < 12)
-
-
-def chen_confidence(a: Card, b: Card) -> float:
-    """Normalize Chen's [-1.5, 20] range to a [0, 1] preflop confidence.
-
-    This measures starting-hand strength, not win probability or whether a
-    call is profitable; it does not account for opponents, position or price.
-    Usage: confidence = chen_confidence(*state.my_player.hole_cards)
-    """
-    return max(0.0, min(1.0, (chen(a, b) + 1.5) / 21.5))
-
-
-def log_completed_hands(state: GameState) -> None:
-    """Append delivered HandRecords as PHH, preserving unknown hole cards."""
-    observer = state.my_player.id
-    for hand in state.previous_hands:
-        # Rotate physical seats to the PHH convention without changing ids.
-        first_blind = Blind.BIG if len(hand.players) == 2 else Blind.SMALL
-        first = next(i for i, player in enumerate(hand.players) if player.blind is first_blind)
-        players = hand.players[first:] + hand.players[:first]
-        seats = {player.id: i+1 for i, player in enumerate(players)}
-        signature = (_log_session, hand.number, tuple(seats),
-                     tuple(hand.actions), tuple(map(card_to_string, hand.board)))
-        hand_id = hashlib.sha256(repr(signature).encode()).hexdigest()
-        if hand_id in _logged_hands:
+    for action in actions:
+        while current < action.street:
+            refund()
+            bets = [0.]*n
+            current += 1
+        seat = seats[action.id]
+        if action.kind is Action.Kind.FOLD:
+            folded[seat] = True
+            summaries[current, seat, 3] += 1
             continue
-        known = {player_id: ''.join(sorted(map(card_to_string, cards)))
-                 for player_id, cards in hand.shown.items()}
-        # Save our own privately observed cards even when we folded or mucked.
-        observed = _observed_hands.get(observer)
-        if observed is not None:
-            player_ids, actions, board, cards = observed
-            if (player_ids == frozenset(seats)
-                    and list(actions) == hand.actions[:len(actions)]
-                    and board.issubset(hand.board)):
-                known[observer] = cards
-                del _observed_hands[observer]
-        actions = [f'd dh p{seats[player.id]} {known.get(player.id, "????")}'
-                   for player in players]
-        board = ''.join(map(card_to_string, hand.board))
-        dealt_street = 0
-        for action in hand.actions:
-            while dealt_street < action.street:
-                dealt_street += 1
-                cards = board[:6] if dealt_street == 1 else board[2*dealt_street+2:2*dealt_street+4]
-                actions.append(f'd db {cards}')
-            player = f'p{seats[action.id]}'
-            if action.kind is Action.Kind.RAISE:
-                actions.append(f'{player} cbr {action.chips_bet}')
-            elif action.kind is Action.Kind.FOLD:
-                actions.append(f'{player} f')
+        call = max(0., max(bets)-bets[seat])
+        amount = min(remaining[seat], max(0., action.chips_bet-bets[seat]))
+        # CHECK/CALL are identical in PHH, so classify by outstanding call.
+        kind = 2 if action.kind is Action.Kind.RAISE else int(call > 0)
+        summaries[current, seat, kind] += 1
+        summaries[current, seat, 4] += amount/bb
+        bets[seat] += amount
+        remaining[seat] -= amount
+        paid[seat] += amount
+    while current < street:
+        refund()
+        bets = [0.]*n
+        current += 1
+    if finish:
+        refund()
+    return remaining, bets, folded, paid, summaries
+
+
+def _starting_stacks(state, players):
+    """Recover contributions from public raise-to history, including refunds."""
+    if not state.history:
+        # On an actual first preflop turn, these are exactly the forced posts.
+        # Synthetic postflop score states lack earlier contributions; keep that
+        # unknown money in the shared main pot rather than invent side pots.
+        paid = [float(state.ante+p.chips_bet) for p in players]
+        return [p.chips_in_stack+c for p, c in zip(players, paid)], paid
+    n = len(players)
+    seats = {p.id: i for i, p in enumerate(players)}
+    street = max(0, len(state.community_cards)-2)
+    bets = _blinds(players, state.small_blind, state.big_blind)
+    # Short blinds can be inferred directly on preflop score/test states.
+    if street == 0:
+        for i, player in enumerate(players):
+            if player.chips_in_stack == 0:
+                bets[i] = min(bets[i], player.chips_bet)
+    paid = [state.ante+b for b in bets]
+    current = 0
+    for action in state.history:
+        if action.street != current:
+            top = max(range(n), key=bets.__getitem__)
+            paid[top] -= max(0., bets[top]-max(b for i, b in enumerate(bets) if i != top))
+            bets = [0.]*n
+            current = action.street
+        seat = seats[action.id]
+        if action.kind is not Action.Kind.FOLD:
+            paid[seat] += max(0., action.chips_bet-bets[seat])
+            bets[seat] = action.chips_bet
+    if current < street:
+        top = max(range(n), key=bets.__getitem__)
+        paid[top] -= max(0., bets[top]-max(b for i, b in enumerate(bets) if i != top))
+        bets = [0.]*n
+    # This also supports the engine's synthetic score states with no history.
+    for i, player in enumerate(players):
+        paid[i] += player.chips_bet-bets[i]
+    # Correct inferable short blind/ante posts by inactive all-in players.
+    surplus = max(0., sum(paid)-state.chips_in_pot)
+    for i, player in enumerate(players):
+        if surplus and not player.chips_in_stack and not any(a.id == player.id for a in state.history):
+            reduction = min(surplus, max(0., paid[i]-player.chips_bet))
+            paid[i] -= reduction
+            surplus -= reduction
+    return [p.chips_in_stack+max(0., paid[i]) for i, p in enumerate(players)], paid
+
+
+def _public(players, stacks, blinds, ante, actions, street, board, target, bb, finish=False):
+    remaining, bets, folded, paid, summaries = _replay(
+        players, stacks, blinds, ante, actions, street, bb, finish)
+    n = len(players)
+    pad = lambda values: list(values)+[0.]*(8-n)
+    odds = board_holdings(tuple(sorted(board)))[3]
+    features = ([float(i == street) for i in range(4)]
+                + [float(i == target) for i in range(8)]
+                + [float(i < n) for i in range(8)]
+                + pad(s/bb for s in stacks) + pad(r/bb for r in remaining)
+                + pad(b/bb for b in bets) + pad(map(float, folded))
+                + pad(b/bb for b in blinds)
+                + [sum(paid)/bb, max(0., max(bets)-bets[target])/bb, n/8]
+                + [float(i in board) for i in range(52)]
+                + [float(p > 0) for p in odds] + list(odds)
+                + summaries.reshape(-1).tolist())
+    if len(features) != BASE_SIZE:
+        raise ValueError('Opponent feature layout mismatch')
+    return features
+
+
+def _context(public, previous):
+    features = list(public)
+    for record in previous[-3:][::-1]:
+        features += [1.] + list(record)
+    return features + [0.]*(INPUT_SIZE-len(features))
+
+
+_MODEL, _MEAN, _STD = None, None, None
+MODEL_PATH = Path(os.environ.get('POKER_OPPONENT_MODEL',
+                                str(Path(__file__).with_name('opponent_best.pth'))))
+MODEL_STATUS = 'No checkpoint: using Chen-weighted legal ranges'
+if MODEL_PATH.is_file():
+    import torch
+    from torch import nn
+    torch.set_num_threads(1)
+    checkpoint = torch.load(MODEL_PATH, map_location='cpu', weights_only=True)
+    if (checkpoint.get('schema') != 'opponent-v1'
+            or checkpoint.get('input_features') != INPUT_SIZE
+            or tuple(checkpoint.get('classes', ())) != CLASSES):
+        raise ValueError('Expected an opponent-v1 ten-class checkpoint, not an SR4/SR5 model')
+    _MODEL = nn.Sequential(nn.Linear(INPUT_SIZE, 256), nn.ReLU(), nn.Dropout(.15),
+                           nn.Linear(256, 128), nn.ReLU(), nn.Dropout(.15), nn.Linear(128, 10))
+    _MODEL.load_state_dict(checkpoint['model_state_dict'])
+    _MODEL.eval()
+    _MEAN, _STD = checkpoint['mean'].float(), checkpoint['std'].float()
+    if (_MEAN.shape != (INPUT_SIZE,) or _STD.shape != (INPUT_SIZE,)
+            or not torch.isfinite(_MEAN).all() or not torch.isfinite(_STD).all()
+            or not (_STD > 0).all()):
+        raise ValueError('Invalid opponent checkpoint normalization')
+    MODEL_STATUS = f'Using opponent classifier: {MODEL_PATH.name}'
+
+
+class Memory:
+    def __init__(self):
+        self.history = {}
+        self.seen = OrderedDict()
+        self.hand_key = None
+        self.latest_hand = 0
+        self.ranges = {}
+        self.last_decision = {}
+
+
+_MEMORIES = OrderedDict()
+
+
+def _learn(state, memory, deadline):
+    if _MODEL is None:
+        return
+    # Only public shown cards populate context. Re-delivered records are ignored.
+    for record in state.previous_hands:
+        signature = (record.number, tuple(p.id for p in record.players),
+                     tuple(record.actions), tuple(sorted(card_text(c) for c in record.board)))
+        if signature in memory.seen:
+            continue
+        if time.perf_counter() > deadline - .15:
+            break
+        players = _ordered(record.players)
+        stacks = [p.chips_in_stack+p.chips_bet-record.won.get(p.id, 0) for p in players]
+        blinds = _blinds(players, record.small_blind, record.big_blind)
+        board = tuple(sorted(CARD_INDEX[card_text(c)] for c in record.board))
+        if len(board) >= 3 and 2 <= len(players) <= 8:
+            street = len(board)-2
+            for target, player in enumerate(players):
+                if player.id not in record.shown:
+                    continue
+                hole = {CARD_INDEX[card_text(c)] for c in record.shown[player.id]}
+                public = _public(players, stacks, blinds, record.ante, record.actions,
+                                 street, board, target, record.big_blind, finish=True)
+                label = _category((*board, *hole))
+                previous = public + [float(i in hole) for i in range(52)] + [float(i == label) for i in range(10)]
+                memory.history.setdefault(player.id, []).append(previous)
+                memory.history[player.id] = memory.history[player.id][-3:]
+        memory.seen[signature] = None
+        if len(memory.seen) > 256:
+            memory.seen.popitem(last=False)
+
+
+def _chen(pair):
+    high, low = sorted((pair[0]//4+2, pair[1]//4+2), reverse=True)
+    score = {14: 10, 13: 8, 12: 7, 11: 6}.get(high, high/2)
+    gap = high-low-1
+    if gap < 0:
+        return max(2*score, 5)+(high == 5)
+    return score-min(gap, 4)-(gap >= 3)+2*(pair[0] % 4 == pair[1] % 4)+(gap <= 1 and high < 12)
+
+
+def opponent_ranges(state, opponents, memory, board, hole):
+    pairs, labels, counts, prior = board_holdings(board)
+    hero_dead = set(hole)
+    players = _ordered(state.players)
+    stacks, _ = _starting_stacks(state, players)
+    blinds = _blinds(players, state.small_blind, state.big_blind)
+    seats = {p.id: i for i, p in enumerate(players)}
+    street = max(0, len(board)-2)
+    result = []
+    for opponent in opponents:
+        last = next((i for i in range(len(state.history)-1, -1, -1)
+                     if state.history[i].id == opponent.id), None)
+        action_key = tuple(state.history[:last+1]) if last is not None else ()
+        saved = memory.ranges.get(opponent.id)
+        if (board and _MODEL is not None and last is not None
+                and state.history[last].street == street
+                and (saved is None or saved[0] != (board, action_key))):
+            public = _public(players, stacks, blinds, state.ante, state.history[:last+1],
+                             street, board, seats[opponent.id], state.big_blind)
+            features = _context(public, memory.history.get(opponent.id, []))
+            with torch.inference_mode():
+                tensor = torch.tensor(features, dtype=torch.float32)
+                probabilities = _MODEL(((tensor-_MEAN)/_STD).unsqueeze(0)).softmax(-1)[0].tolist()
+            probabilities = [.85*p+.15*q for p, q in zip(probabilities, prior)]
+            weighted = [(pair, probabilities[label]/counts[label])
+                        for pair, label in zip(pairs, labels) if not hero_dead.intersection(pair)]
+            saved = ((board, action_key), weighted)
+            memory.ranges[opponent.id] = saved
+        if saved is not None:
+            # Carry a hole-card distribution across streets, conditioning on new cards.
+            weighted = [(pair, weight) for pair, weight in saved[1]
+                        if not set(pair).intersection((*board, *hole))]
+        else:
+            preflop = [a.kind for a in state.history if a.id == opponent.id and a.street == 0]
+            strength = .22 if Action.Kind.RAISE in preflop else .12 if Action.Kind.CALL in preflop else 0.
+            weighted = [(pair, math.exp(strength*_chen(pair))) for pair in pairs
+                        if not hero_dead.intersection(pair)]
+        if not weighted:
+            weighted = [(pair, 1.) for pair in pairs if not hero_dead.intersection(pair)]
+        holdings = [pair for pair, _ in weighted]
+        cumulative, total = [], 0.
+        for _, weight in weighted:
+            total += weight
+            cumulative.append(total)
+        result.append((holdings, cumulative))
+    return result
+
+
+def _pots(contributions, folded, hero):
+    """Hero-eligible side pots; uncalled excess is a one-player refund pot."""
+    result, previous = [], 0.
+    for level in sorted({c for c in contributions if c > 0}):
+        amount = sum(min(c, level)-min(c, previous) for c in contributions)
+        eligible = tuple(i for i, c in enumerate(contributions) if c >= level and not folded[i])
+        if result and (not eligible or eligible == result[-1][1]):
+            result[-1] = (result[-1][0]+amount, result[-1][1])
+        else:
+            result.append((amount, eligible))
+        previous = level
+    return [(amount, eligible) for amount, eligible in result if hero in eligible]
+
+
+def _scenarios(state, players, hero, paid):
+    me = state.my_player
+    outstanding = max(p.chips_bet for p in players)-me.chips_bet
+    call = min(me.chips_in_stack, max(0, outstanding))
+    left = me.chips_in_stack-outstanding
+    sizes = [0]
+    if left > 0 and any(p.id != me.id and not p.has_folded and p.chips_in_stack > 0 for p in players):
+        for fraction in (.5, 1.):
+            sizes.append(int(min(left, max(state.min_raise, int(fraction*(state.chips_in_pot+call))))))
+    scenarios = []
+    for size in sorted(set(sizes)):
+        contributions = list(paid)
+        cost = call+size
+        contributions[hero] += cost
+        if size:
+            target = me.chips_bet+outstanding+size
+            for i, p in enumerate(players):
+                if i != hero and not p.has_folded:
+                    contributions[i] += min(p.chips_in_stack, max(0, target-p.chips_bet))
+        pots = _pots(contributions, [p.has_folded for p in players], hero)
+        scenarios.append((size, cost, pots))
+    return scenarios
+
+
+def estimate_actions(state, memory, deadline):
+    """Monte Carlo chip EV; independent ranges conditioned on no card collisions."""
+    players = _ordered(state.players)
+    hero = next(i for i, p in enumerate(players) if p.id == state.my_player.id)
+    opponents = [p for p in players if p.id != state.my_player.id and not p.has_folded]
+    opponent_seats = [i for i, p in enumerate(players) if p.id != state.my_player.id and not p.has_folded]
+    hole = tuple(sorted(CARD_INDEX[card_text(c)] for c in state.my_player.hole_cards))
+    board = tuple(sorted(CARD_INDEX[card_text(c)] for c in state.community_cards))
+    ranges = opponent_ranges(state, opponents, memory, board, hole)
+    _, paid = _starting_stacks(state, players)
+    # Preserve unassigned dead money in synthetic states (real histories sum exactly).
+    extra_pot = max(0., state.chips_in_pot-sum(paid))
+    scenarios = _scenarios(state, players, hero, paid)
+    if extra_pot:
+        for _, _, pots in scenarios:
+            pots.append((extra_pot, (hero, *opponent_seats)))
+    seed = hashlib.sha256(repr((tuple((p.id, p.chips_bet, p.chips_in_stack) for p in players),
+                                hole, board, tuple(state.history))).encode()).digest()
+    rng = random.Random(int.from_bytes(seed[:8], 'big'))
+    sums, squares = [0.]*len(scenarios), [0.]*len(scenarios)
+    count = 0
+    while count < SIMULATIONS and time.perf_counter() < deadline:
+        # Reject the WHOLE joint draw when two opponents overlap, avoiding
+        # order-dependent sequential range sampling and impossible deals.
+        for _ in range(64):
+            dead, hands = set((*hole, *board)), []
+            for holdings, cumulative in ranges:
+                pair = rng.choices(holdings, cum_weights=cumulative, k=1)[0]
+                if dead.intersection(pair):
+                    break
+                dead.update(pair)
+                hands.append(pair)
             else:
-                actions.append(f'{player} cc')
-        # All-in runouts may deal streets with no subsequent player actions.
-        final_street = max(0, len(hand.board)-2)
-        while dealt_street < final_street:
-            dealt_street += 1
-            cards = board[:6] if dealt_street == 1 else board[2*dealt_street+2:2*dealt_street+4]
-            actions.append(f'd db {cards}')
-        for player_id in hand.shown:
-            actions.append(f'p{seats[player_id]} sm {known[player_id]}')
-        winnings = [hand.won.get(player.id, 0) for player in players]
-        finishing = [player.chips_in_stack for player in players]
-        # chips_bet in a HandRecord includes every street and the ante,
-        # with uncalled bets already returned by the engine.
-        starting = [player.chips_in_stack + player.chips_bet - winnings[i]
-                    for i, player in enumerate(players)]
-        data = {
-            'variant': 'NT',
-            'ante_trimming_status': False,
-            'antes': [hand.ante]*len(players),
-            'blinds_or_straddles': [hand.small_blind, hand.big_blind]+[0]*(len(players)-2),
-            'min_bet': hand.big_blind,
-            'starting_stacks': starting,
-            'actions': actions,
-            'players': [str(player.id) for player in players],
-            'finishing_stacks': finishing,
-            'winnings': winnings,
-            'venue': 'WarwickAI poker-comp',
-            'hand': hand_id,
-            '_log_session': _log_session,
-            '_observer_id': str(observer),
-        }
-        # JSON scalar/list syntax here is also valid TOML. Each unique table
-        # is one hand, as expected by HandHistory.load_all in scwipt.py.
-        record = '\n[h_'+hand_id+']\n'
-        record += '\n'.join(f'{key} = {json.dumps(value)}' for key, value in data.items())+'\n'
-        _HAND_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _HAND_LOG.open('a', encoding='utf-8') as output:
-            # Multiple poker test processes can safely append to one file.
-            fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-            output.write(record)
-            output.flush()
-        _logged_hands.add(hand_id)
-    _observed_hands[observer] = (
-        frozenset(player.id for player in state.players), tuple(state.history),
-        frozenset(state.community_cards),
-        ''.join(sorted(map(card_to_string, state.my_player.hole_cards))),
-    )
+                break
+        else:
+            continue
+        full = (*board, *rng.sample([i for i in range(52) if i not in dead], 5-len(board)))
+        full_treys = [TREYS[i] for i in full]
+        scores = {hero: EVALUATOR.evaluate(full_treys, [TREYS[i] for i in hole])}
+        for seat, hand in zip(opponent_seats, hands):
+            scores[seat] = EVALUATOR.evaluate(full_treys, [TREYS[i] for i in hand])
+        for index, (_, cost, pots) in enumerate(scenarios):
+            returned = 0.
+            for amount, eligible in pots:
+                best = min(scores[i] for i in eligible)
+                winners = [i for i in eligible if scores[i] == best]
+                if hero in winners:
+                    returned += amount/len(winners)
+            profit = returned-cost
+            sums[index] += profit
+            squares[index] += profit*profit
+        count += 1
+    if not count:
+        return [], 0
+    estimates = []
+    for (size, cost, pots), total, square in zip(scenarios, sums, squares):
+        ev = total/count
+        error = math.sqrt(max(0., square/count-ev*ev)/count)
+        eligible_pot = sum(amount for amount, _ in pots)
+        estimates.append(dict(raise_by=size, cost=cost, ev=ev, stderr=error,
+                              equity=(ev+cost)/eligible_pot if eligible_pot else 1.,
+                              pot_odds=cost/eligible_pot if eligible_pot else 0.))
+    return estimates, count
+
+
+def defaultAI(state: GameState) -> Action:
+    to_call = max(p.chips_bet for p in state.players)-state.my_player.chips_bet
+    return Action.check() if to_call <= 0 else Action.fold()
 
 
 def myAI(state: GameState) -> Action:
-    #log_completed_hands(state)
-    mycards = list(state.my_player.hole_cards)
-    to_call = max(player.chips_bet for player in state.players)-state.my_player.chips_bet
-    if len(state.community_cards) == 0:
-        #return Action.call()
-        # No preflop training rows: check or call at most one big blind.
-        #return Action.check() if to_call == 0 else Action.call() if chen(mycards[0],mycards[1]) >= 5 else Action.fold()
-        #return Action.check() if to_call == 0 else Action.call() if random.random() < (0.25+(chen_confidence( mycards[0],mycards[1]))) else Action.fold()
-        #return Action.check() if to_call == 0 else Action.call() if to_call <= state.my_player.chips_in_stack* else Action.fold()
-        return Action.check() if to_call == 0 else Action.call() if to_call <= state.big_blind*10 else Action.fold()
-    if len(state.players) > 8:
-        return Action.check() if to_call == 0 else Action.fold()
-    features = torch.tensor(generate_features(state), dtype=torch.float32)
-    # SR5: uncomment this and comment out the SR4 feature call above.
-    # features = torch.tensor(generate_features_sr5(state), dtype=torch.float32)
-    with torch.inference_mode():
-        probability = _model(((features-_mean)/_std).unsqueeze(0)).sigmoid().item()
-    can_raise = any(player.id != state.my_player.id and not player.has_folded
-                    and player.chips_in_stack > 0 for player in state.players)
-    if probability >= 0.7 and can_raise and state.my_player.chips_in_stack >= to_call+state.min_raise:
-        return Action.raise_by(state.min_raise)
-    if to_call == 0:
+    start = time.perf_counter()
+    hero_id = state.my_player.id
+    memory = _MEMORIES.setdefault(hero_id, Memory())
+    _MEMORIES.move_to_end(hero_id)
+    if len(_MEMORIES) > 32:
+        _MEMORIES.popitem(last=False)
+    _learn(state, memory, start+DECISION_SECONDS)
+    if state.previous_hands:
+        memory.latest_hand = max(record.number for record in state.previous_hands)
+    # A new hand has a different deal or a history that no longer extends the
+    # preceding call. Do not carry ranges into another hand or another hero.
+    key = (memory.latest_hand, tuple(sorted(p.id for p in state.players if p.id is not None)),
+           tuple(sorted(card_text(c) for c in state.my_player.hole_cards)))
+    old_key = memory.hand_key
+    history = tuple(state.history)
+    if old_key is None or old_key[0] != key or history[:len(old_key[1])] != old_key[1]:
+        memory.ranges.clear()
+    memory.hand_key = (key, history)
+    if not 2 <= len(state.players) <= 8 or len(state.community_cards) not in (0, 3, 4, 5):
+        return defaultAI(state)
+    estimates, count = estimate_actions(state, memory, start+DECISION_SECONDS)
+    memory.last_decision = dict(simulations=count, actions=estimates, model=MODEL_STATUS)
+    if not estimates:
+        return defaultAI(state)
+    calling = estimates[0]
+    to_call = max(p.chips_bet for p in state.players)-state.my_player.chips_bet
+    best = max(estimates, key=lambda item: item['ev'])
+    # Require a clear value advantage to raise; uncertainty discourages marginal
+    # paid calls. Checking is always preferable to folding when it is free.
+    raise_margin = max(state.big_blind, .03*state.chips_in_pot, best['stderr'])
+    if best['raise_by'] and best['ev'] > max(0., calling['ev'])+raise_margin:
+        return Action.raise_by(int(best['raise_by']))
+    if to_call <= 0:
         return Action.check()
-    return Action.call() if probability >= 0.5 else Action.fold()
-
-
-def defaultAI(state: GameState) -> Action: # This ai runs if myAI raises an exception, returns an invalid action or takes too long
-    return Action.call()
-    return Action.check() if state.my_player.chips_bet == max(player.chips_bet for player in state.players) else Action.fold()
-
-"""
-if comsize == len(state.community_cards):
-        return Action.call()
-    comsize = len(state.community_cards)
-    mh = list(state.my_player.hole_cards)
-    comc = list(state.community_cards)
-    hand = [treys.Card.new(card_to_string(mh[0])),treys.Card.new(card_to_string(mh[1]))]
-    board = []
-    for c in comc:
-        board.append(treys.Card.new(card_to_string(c)))
-    #print("67")
-    heval = treys.Evaluator()
-    #print("hehe")
-    hscore = heval.evaluate(hand=hand,board=board)
-    #print("hehe2")
-    p_rank = heval.get_five_card_rank_percentage(hscore)
-    #print("hehe3")
-    #print(p_rank)
-    #print("hehe end")
-    #if len(state.community_cards) == 0:
-"""
-
-
-def calculate_hand_strength(hole_cards, community_cards):
-    all_cards = list(hole_cards) + list(community_cards)
-    
-    # flush
-    suits = [card.suit for card in all_cards]
-    is_flush = any(suits.count(suit) >= 5 for suit in Suit)
-
-    # straight
-    present_values = set(rank_values[card.rank] for card in all_cards)
-    # low ace
-    if 14 in present_values:
-        present_values.add(1)
-
-    is_straight = False
-    for low_end in range(1, 11):
-        if set(range(low_end, low_end + 5)).issubset(present_values):
-            is_straight = True
-            break
-
-    # pair three, four
-    ranks = [card.rank for card in all_cards]
-    counts = [ranks.count(rank) for rank in set(ranks)]
-
-    pairs = counts.count(2)
-    threes = counts.count(3)
-    quads = counts.count(4)
-
-    is_full_house = (threes > 0 and pairs > 0) or threes > 1
-
-    # hole cards used for pair, three, four check
-    hole_ranks = [card.rank for card in hole_cards]
-    board_ranks = [card.rank for card in community_cards]
-
-    hole_contributed = (hole_ranks[0] == hole_ranks[1]) or (hole_ranks[0] in board_ranks) or (hole_ranks[1] in board_ranks)
-
-    board_suits = [card.suit for card in community_cards]
-    flush_possible = any(board_suits.count(suit) >= 3 for suit in Suit)
-
-    if is_flush and is_straight:
-        return 0.95 # Straight Flush
-    elif quads > 0:
-        return 0.95 if hole_contributed else 0.10 # Four of a kind
-    elif is_full_house:
-        return 0.95 if hole_contributed else 0.10 # Full House
-    elif is_flush:
-        return 0.90 # Flush
-    elif is_straight:
-        return 0.90 if not flush_possible else 0.85 # Straight
-    elif threes > 0:
-        return 0.70 if hole_contributed else 0.10 # Three of a Kind
-    elif pairs >= 2:
-        return 0.60 if hole_contributed else 0.10 # Two Pair
-    elif pairs == 1:
-        return 0.40 if hole_contributed else 0.10 # One Pair
-    else:
-        return 0.10 # High Card
-
-def get_best_hand(com_cards):
-    max_strength = -1
-    for R in Rank:
-        for S in Suit:
-            for r in Rank:
-                for s in Suit:
-                    h = {Card.new(R,S),Card.new(r,s)}
-                    max_strength = max(max_strength,calculate_hand_strength(h,com_cards))
-    return max_strength
-                    
+    return Action.call() if calling['ev'] > .5*calling['stderr'] else Action.fold()
